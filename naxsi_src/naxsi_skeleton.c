@@ -1477,7 +1477,7 @@ ngx_http_naxsi_score_variable(ngx_http_request_t *r, ngx_http_variable_value_t *
     if (v->data == NULL) {
         return NGX_ERROR;
     }
-    p = v->data;
+    p = (char*) v->data;
 
     if (others) {
         memcpy(p, "$OTHERS,", 8); /* strlen($OTHERS,) */
@@ -1538,7 +1538,7 @@ ngx_http_naxsi_match_variable(ngx_http_request_t *r, ngx_http_variable_value_t *
         return NGX_ERROR;
     }
 
-    p = v->data;
+    p = (char*) v->data;
     mr = ctx->matched->elts;
     for (i = 0; i < ctx->matched->nelts; i++) {
         const char *name_data = mr[i].name->len? (const char*)mr[i].name->data : "-";
