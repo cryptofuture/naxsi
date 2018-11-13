@@ -29,7 +29,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "naxsi.h"
-
+#include "assert.h"
 /* used to store locations during the configuration time. 
    then, accessed by the hashtable building feature during "init" time. */
 
@@ -108,6 +108,22 @@ ngx_http_rule_t nx_int__empty_post_body = {/*type*/ 0, /*whitelist flag*/ 0,
 ngx_http_rule_t *nx_int__libinject_sql; /*ID:17*/
 ngx_http_rule_t *nx_int__libinject_xss; /*ID:18*/
 
+ngx_http_rule_t nx_int__no_rules = {/*type*/ 0, /*whitelist flag*/ 0, 
+				    /*wl_id ptr*/ NULL, /*rule_id*/ 19,
+				    /*log_msg*/ NULL, /*score*/ 0, 
+				    /*sscores*/ NULL,
+				    /*sc_block*/ 0,  /*sc_allow*/ 0, 
+				    /*block*/ 0,  /*allow*/ 0, /*drop*/ 1, /*log*/ 0,
+				    /*br ptrs*/ NULL};
+
+ngx_http_rule_t nx_int__bad_utf8 = {/*type*/ 0, /*whitelist flag*/ 0, 
+				    /*wl_id ptr*/ NULL, /*rule_id*/ 20,
+				    /*log_msg*/ NULL, /*score*/ 0, 
+				    /*sscores*/ NULL,
+				    /*sc_block*/ 0,  /*sc_allow*/ 0, 
+				    /*block*/ 0,  /*allow*/ 0, /*drop*/ 1, /*log*/ 0,
+				    /*br ptrs*/ NULL};
+
 
 
 
@@ -152,7 +168,7 @@ void			ngx_http_dummy_rawbody_parse(ngx_http_request_ctx_t *ctx,
 						     ngx_http_request_t	 *r,
 						     u_char			*src,
 						     u_int			 len);
-
+unsigned char		*ngx_utf8_check(ngx_str_t *str);
 
 /*
 ** in : string to inspect, associated rule
@@ -790,9 +806,11 @@ ngx_int_t ngx_http_nx_log(ngx_http_request_ctx_t *ctx,
   u_int		sz_left, sub, offset = 0, i;
   ngx_str_t	*fragment, *tmp_uri;
   ngx_http_special_score_t	*sc;
-  const char 	*fmt_base = "ip=%.*s&server=%.*s&uri=%.*s&learning=%d&vers=%.*s&total_processed=%zu&total_blocked=%zu&block=%d";
+  const char 	*fmt_base = "ip=%.*s&server=%.*s&uri=%.*s&vers=%.*s&total_processed=%zu&total_blocked=%zu&config=%.*s";
   const char	*fmt_score = "&cscore%d=%.*s&score%d=%zu";
   const char	*fmt_rm = "&zone%d=%s&id%d=%d&var_name%d=%.*s";
+  const char    *fmt_config =  ctx->learning ? (ctx->drop ? "learning-drop" : "learning" ) :  (ctx->drop ? "drop" : (ctx->block ? "block" : ""));
+
   ngx_http_dummy_loc_conf_t	*cf;
   ngx_http_matched_rule_t	*mr;
   char		 tmp_zone[30];
@@ -827,11 +845,14 @@ ngx_int_t ngx_http_nx_log(ngx_http_request_ctx_t *ctx,
   /* 
   ** don't handle uri > 4k, string will be split
   */
+
+  assert(strlen(fmt_config) != 0);
   sub = snprintf((char *)fragment->data, sz_left, fmt_base, r->connection->addr_text.len,
 		 r->connection->addr_text.data,
 		 r->headers_in.server.len, r->headers_in.server.data,
-		 tmp_uri->len, tmp_uri->data, ctx->learning ? 1 : 0, strlen(NAXSI_VERSION),
-		 NAXSI_VERSION, cf->request_processed, cf->request_blocked, ctx->block ? 1 : (ctx->drop ? 1 : 0));
+		 tmp_uri->len, tmp_uri->data,  strlen(NAXSI_VERSION),
+		 NAXSI_VERSION, cf->request_processed, cf->request_blocked,
+		 strlen(fmt_config), fmt_config);
   
   if (sub >= sz_left)
     sub = sz_left - 1;
@@ -1397,6 +1418,7 @@ ngx_http_basestr_ruleset_n(ngx_pool_t	*pool,
 	   zone == RAW_BODY ? "RAW_BODY" : "UNKNOWN"); 
 
   
+  
   if (!rules) {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, req->connection->log, 0, 
 		  "XX-no rules, wtf ?!"); 
@@ -1406,7 +1428,15 @@ ngx_http_basestr_ruleset_n(ngx_pool_t	*pool,
   NX_DEBUG(_debug_basestr_ruleset , NGX_LOG_DEBUG_HTTP, req->connection->log, 0, 
 	   "XX-checking %d rules ...", rules->nelts); 
 
-  
+  /* check for overlong/surrogate utf8 encoding */
+  if (ngx_utf8_check(name) != NULL) {
+    ngx_http_apply_rulematch_v_n(&nx_int__bad_utf8, ctx, req, NULL, NULL, zone, 1, 1);
+    return (0);
+  }
+  else if (ngx_utf8_check(value) != NULL) {
+    ngx_http_apply_rulematch_v_n(&nx_int__bad_utf8, ctx, req, NULL, NULL, zone, 1, 0);
+    return (0);
+  }
   
   /* call to libinjection */
   ngx_http_libinjection(pool, name, value, ctx, req, zone);
@@ -2061,6 +2091,11 @@ ngx_http_dummy_body_parse(ngx_http_request_ctx_t *ctx,
 			    (u_char *) "application/json", 16)) {
     ngx_http_dummy_json_parse(ctx, r, full_body, full_body_len); 
   }
+  /* 22 = echo -n "application/csp-report" | wc -c */
+  else if (!ngx_strncasecmp(r->headers_in.content_type->value.data,
+                            (u_char *) "application/csp-report", 22)) {
+    ngx_http_dummy_json_parse(ctx, r, full_body, full_body_len);
+  }
   else {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, 
 		  "[POST] Unknown content-type");
@@ -2100,7 +2135,9 @@ ngx_http_dummy_uri_parse(ngx_http_dummy_main_conf_t *main_cf,
   if ( (ctx->block && !ctx->learning) || ctx->drop )
     return ;
   if (!main_cf->generic_rules && !cf->generic_rules) {
-    dummy_error_fatal(ctx, r, "no generic rules ?!");
+    tmp.data = NULL;
+    tmp.len = 0;
+    ngx_http_apply_rulematch_v_n(&nx_int__no_rules, ctx, r, &tmp, &tmp, URL, 1, 0);
     return ;
   }
   tmp.len = r->uri.len;
@@ -2226,7 +2263,7 @@ ngx_http_dummy_data_parse(ngx_http_request_ctx_t *ctx,
   /* check args */
   ngx_http_dummy_args_parse(main_cf, cf, ctx, r);
   /* check method */
-  if ((r->method == NGX_HTTP_POST || r->method == NGX_HTTP_PUT) && 
+  if ((r->method == NGX_HTTP_PATCH || r->method == NGX_HTTP_POST || r->method == NGX_HTTP_PUT) &&
       /* presence of body rules (POST/PUT rules) */
       (cf->body_rules || main_cf->body_rules) && 
       /* and the presence of data to parse */
